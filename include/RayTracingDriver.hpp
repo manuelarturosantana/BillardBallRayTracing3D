@@ -37,7 +37,13 @@
 //     silently skipped;
 //   - an escaping ray's final segment is drawn one scene-bounding-box
 //     diagonal past its last point, so the tail is visible at a scale that
-//     matches the geometry.
+//     matches the geometry;
+//   - the self-intersection nudge after a bounce is sized off the largest
+//     curvature padding any patch's stage-1 test uses (SurfacePatch::
+//     max_sagitta()), not an arbitrary tiny constant — that padding tests
+//     triangles pushed off the true surface by up to +-sagitta, so a nudge
+//     smaller than that can leave the next ray still inside the padded
+//     shell, re-detecting the same point and getting stuck bouncing in place.
 //
 // Like SurfacePatch.hpp, this pulls in MKL/MPI/OpenMP transitively via
 // Utils/PatchInterpolation.hpp — see SurfacePatch.hpp's header comment.
@@ -60,7 +66,7 @@ public:
     explicit RayTracingDriver(const std::string& patch_directory) {
         load_patches(patch_directory);
         build_bvh();
-        compute_scene_diagonal();
+        compute_scene_scale();
     }
 
     // Configures the rays to trace. Paired 1:1: ray i starts at sources[i]
@@ -156,11 +162,22 @@ private:
     std::vector<Vec3> sources_;
     std::vector<Vec3> directions_;
     std::vector<RayPath> paths_;
+    double max_patch_sagitta_ = 0.0;
 
-    // Fraction of the scene diagonal used to nudge a reflected ray's origin
-    // off the surface it just left, so it doesn't immediately re-hit the
-    // same point due to floating-point roundoff.
+    // Fraction of the scene diagonal used as a floor under the self-
+    // intersection nudge, for the degenerate case where every patch is
+    // perfectly flat (max_patch_sagitta_ == 0, so that alone would nudge by
+    // nothing at all).
     static constexpr double kSelfIntersectEpsilonFactor = 1e-9;
+
+    // Safety multiple on max_patch_sagitta_ for that nudge: SurfacePatch's
+    // stage-1 test checks triangles pushed up to +-sagitta off the true
+    // surface (see SurfacePatch::compute_cell_padding()), so a reflected
+    // ray has to clear a good deal more than sagitta itself to be sure it's
+    // outside every padded copy — otherwise the very next intersect() call
+    // can re-detect the point it just left through that padding, and the
+    // ray gets stuck bouncing in place instead of moving on.
+    static constexpr double kSagittaClearanceFactor = 5.0;
 
     void load_patches(const std::string& patch_directory) {
         namespace fs = std::filesystem;
@@ -198,10 +215,11 @@ private:
         bvh_ = std::make_unique<BVH>(std::move(objects));
     }
 
-    void compute_scene_diagonal() {
+    void compute_scene_scale() {
         AABB box = patches_.front()->bounding_box();
         for (const auto& patch : patches_) {
             box = union_box(box, patch->bounding_box());
+            max_patch_sagitta_ = std::max(max_patch_sagitta_, patch->max_sagitta());
         }
         const double dx = box.max.x - box.min.x;
         const double dy = box.max.y - box.min.y;
@@ -253,7 +271,8 @@ private:
 
             dir = reflect(dir, hit->normal);
 
-            const double eps = kSelfIntersectEpsilonFactor * scene_diagonal_;
+            const double eps = std::max(kSelfIntersectEpsilonFactor * scene_diagonal_,
+                                         kSagittaClearanceFactor * max_patch_sagitta_);
             origin = { hit->point.x + dir.x * eps,
                        hit->point.y + dir.y * eps,
                        hit->point.z + dir.z * eps };

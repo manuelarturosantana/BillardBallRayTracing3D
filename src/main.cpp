@@ -13,22 +13,26 @@ int main(int argc, char** argv) {
         (argc > 1) ? argv[1] : "/scratch/msantana/PatchFolders/Nacelle";
 
     // Output VTK PolyData file — open it in ParaView to see the traced paths.
-    std::string output_vtk = (argc > 2) ? argv[2] : "ray_traces.vtk";
+    std::string output_vtk = (argc > 2) ? argv[2] : "/scratch/msantana/RayTracing/ray_traces.vtk";
 
     // --- Rays --------------------------------------------------------------
     // Edit these to set up whatever incident rays you want to trace.
     // Paired 1:1: ray i starts at sources[i] and travels along directions[i].
     std::vector<Vec3> sources = {
         { 1,  0.5,  3.2 },
+        { 0.5, 0.0,-1},
+        { 0.6, 0.0,-1},
     };
     std::vector<Vec3> directions = {
         { 1,  -1,   -1  },
+        {-1, 0, 0},
+        {0, 1, 1},
     };
 
     try {
         RayTracingDriver driver(patch_directory);
         driver.set_rays(sources, directions);
-        driver.run(/*max_bounces=*/50);
+        driver.run(/*max_bounces=*/300);
 
         int escaped = 0, trapped = 0, errored = 0;
         const auto& paths = driver.paths();

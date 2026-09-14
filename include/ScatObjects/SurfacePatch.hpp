@@ -23,17 +23,23 @@
 //   - computes the centroid and an axis-aligned bounding box (BVH needs
 //     these up front);
 //   - builds a coarse, equally-spaced grid over the reference square
-//     [-1,1] x [-1,1] by Lagrange-interpolating the node data.
+//     [-1,1] x [-1,1] by Lagrange-interpolating the node data;
+//   - measures, per coarse cell, how far the true surface bulges away from
+//     that cell's flat approximation (compute_cell_padding()), and inflates
+//     the bounding box by the worst case so BVH culling can't reject a
+//     patch whose curvature the coarse grid understates.
 //
 // intersect() is two stages. Stage 1: each coarse grid square is split into
-// two triangles and tested with Moller-Trumbore, closest hit wins — this
-// only locates which coarse triangle the ray crosses, using the patch's
-// piecewise-linear approximation. Stage 2: Newton's method refines that hit
-// onto the true interpolated surface, solving X(u,v) - ray(t) = 0 for
-// (u,v,t) starting from the winning triangle's (u,v) centroid and its
-// stage-1 t. On failure to converge (iteration cap, singular Jacobian, or a
-// solution outside the patch's [-1,1]x[-1,1] domain) it throws rather than
-// silently falling back — see newton_refine().
+// two triangles, tested with Moller-Trumbore both as-is and pushed out by
+// that cell's measured curvature margin along its normal (a ray can cross
+// the true curved surface in the gap between a flat coarse chord and the
+// real bulge — the margin closes that gap), closest hit wins. This only
+// locates which coarse triangle the ray crosses. Stage 2: Newton's method
+// refines that hit onto the true interpolated surface, solving
+// X(u,v) - ray(t) = 0 for (u,v,t) starting from the winning triangle's
+// (u,v) centroid and its stage-1 t. On failure to converge (iteration cap,
+// singular Jacobian, or a solution outside the patch's [-1,1]x[-1,1]
+// domain) it throws rather than silently falling back — see newton_refine().
 //
 // This header does NOT depend on the IFGF-RP headers directly, but it does
 // pull in Utils/PatchInterpolation.hpp for the Lagrange interpolation, which
@@ -91,13 +97,24 @@ public:
         std::vector<double> u, v;     // size n each, equally spaced in [-1,1]
         std::vector<double> x, y, z;  // size n*n, row-major: idx = i*n + j
 
+        // Per-cell curvature padding: how far the true interpolated surface
+        // strays from this cell's flat bilinear estimate (the "sagitta"),
+        // and a representative surface normal there. See
+        // compute_cell_padding() — this is what keeps intersect()'s stage-1
+        // test from missing a real crossing just because the coarse mesh is
+        // flatter than the true curved patch.
+        std::vector<double> cell_sagitta;  // size (n-1)*(n-1)
+        std::vector<Vec3> cell_normal;     // size (n-1)*(n-1)
+
         Vec3 point(int i, int j) const {
             int idx = i * n + j;
             return { x[idx], y[idx], z[idx] };
         }
+
+        int cell_index(int i, int j) const { return i * (n - 1) + j; }
     };
 
-    static constexpr int kCoarseGridSize = 15;
+    static constexpr int kCoarseGridSize = 40;
 
     // Newton refinement (stage 2 of intersect()): iteration cap and the
     // convergence tolerance on the (u,v,t) update's step size, per iteration.
@@ -110,6 +127,7 @@ public:
     {
         compute_centroid_and_box();
         compute_coarse_grid(kCoarseGridSize);
+        compute_cell_padding();
     }
 
     // Convenience overload matching IFGF-RP's directory + prefix + index
@@ -123,11 +141,26 @@ public:
     const Data& data() const { return data_; }
     const CoarseGrid& coarse_grid() const { return coarse_; }
 
+    // Worst-case sagitta over every coarse cell (see compute_cell_padding()):
+    // how far intersect()'s padded stage-1 test can sit from the true
+    // surface. A ray reflecting off this patch needs to clear a self-
+    // intersection nudge of at least this size, or the very next intersect()
+    // call can re-detect the point it just left through the padded shell —
+    // see RayTracingDriver's use of this.
+    // WARNING: Note this could still possibly break if each subpatch is not well resolved. 
+    // In particular the sagitta is made using the midpoint, and if the max curvature is far
+    // from the midpoint this won't work. With well resolved patches this should be fine though.
+    double max_sagitta() const { return max_sagitta_; }
+
     // Stage 1: brute-force test against the coarse grid. Each grid square
-    // (i,j)-(i+1,j)-(i,j+1)-(i+1,j+1) is split into two triangles and tested
-    // with Moller-Trumbore; the closest hit over all cells wins. Stage 2:
-    // Newton-refine that hit onto the true interpolated surface (see
-    // newton_refine()).
+    // (i,j)-(i+1,j)-(i,j+1)-(i+1,j+1) is split into two triangles; since the
+    // true patch is curved and the coarse mesh is flat, a real crossing can
+    // fall in the gap between the flat chord and the true surface bulge
+    // (compute_cell_padding() measures that gap per cell), so each triangle
+    // is tested as-is AND pushed out ± that cell's sagitta along its local
+    // normal — any of the three catching the ray is enough to seed stage 2.
+    // Closest hit over all cells/paddings wins. Stage 2: Newton-refine that
+    // hit onto the true interpolated surface (see newton_refine()).
     std::optional<Hit> intersect(const Ray& ray) const override {
         const int n = coarse_.n;
         std::optional<Hit> best;
@@ -143,6 +176,10 @@ public:
             }
         };
 
+        auto offset = [](const Vec3& p, const Vec3& normal, double d) -> Vec3 {
+            return { p.x + normal.x * d, p.y + normal.y * d, p.z + normal.z * d };
+        };
+
         for (int i = 0; i + 1 < n; ++i) {
             for (int j = 0; j + 1 < n; ++j) {
                 Vec3 p00 = coarse_.point(i,     j);
@@ -150,10 +187,22 @@ public:
                 Vec3 p01 = coarse_.point(i,     j + 1);
                 Vec3 p11 = coarse_.point(i + 1, j + 1);
 
+                const int idx = coarse_.cell_index(i, j);
+                const double s = coarse_.cell_sagitta[idx];
+                const Vec3& cn = coarse_.cell_normal[idx];
+
                 // Diagonal p00-p11 splits the square into (p00,p10,p11) and
-                // (p00,p11,p01).
-                keep_closer(moller_trumbore(ray, p00, p10, p11), i, j, false);
-                keep_closer(moller_trumbore(ray, p00, p11, p01), i, j, true);
+                // (p00,p11,p01). Test the flat chord (sign 0) plus both
+                // curvature-padded copies — the true surface can bulge to
+                // either side of the coarse chord, and we don't know which.
+                for (double sign : { 0.0, 1.0, -1.0 }) {
+                    const double d = sign * s;
+                    Vec3 q00 = offset(p00, cn, d), q10 = offset(p10, cn, d);
+                    Vec3 q01 = offset(p01, cn, d), q11 = offset(p11, cn, d);
+
+                    keep_closer(moller_trumbore(ray, q00, q10, q11), i, j, false);
+                    keep_closer(moller_trumbore(ray, q00, q11, q01), i, j, true);
+                }
             }
         }
 
@@ -167,6 +216,7 @@ public:
 private:
     Data data_;
     CoarseGrid coarse_;
+    double max_sagitta_ = 0.0;
 
     // Reads one patch file. Mirrors IFGF-RP read_patch_file(): a fixed
     // sequence of whitespace-separated numbers, with an optional trailing
@@ -232,12 +282,12 @@ private:
     }
 
     // Centroid = mean of the surface node positions. Bounding box = tight
-    // min/max over those same node positions.
-    //
-    // Note: the true patch surface is an interpolant through these nodes and
-    // can bulge slightly outside the node hull between them. Once intersect()
-    // exists this box may need a small outward inflation so it never clips a
-    // real hit; leaving it tight for now.
+    // min/max over those same node positions — but see compute_cell_padding(),
+    // called after this from the constructor, which inflates box_ by the
+    // patch's worst-case coarse-grid curvature margin. The dense node grid
+    // itself (imax x jmax, typically much finer than the 15x15 coarse grid)
+    // is assumed to already hug the true surface closely enough that its own
+    // node-to-node bulge is negligible next to that coarse-grid margin.
     void compute_centroid_and_box() {
         const long long n = data_.point_count();
         if (n == 0) {
@@ -294,6 +344,62 @@ private:
                                    data_.y, coarse_.u, coarse_.v, coarse_.y.data());
         lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
                                    data_.z, coarse_.u, coarse_.v, coarse_.z.data());
+    }
+
+    // For each coarse cell, measures how far the true interpolated surface
+    // at the cell's parameter-space midpoint strays from the flat bilinear
+    // estimate of its four coarse corners (the "sagitta"), and records the
+    // surface normal there. intersect() pads its stage-1 triangle test by
+    // this amount along the normal so a ray crossing the true curved
+    // surface isn't missed just because it slips past the (flatter) coarse
+    // chord. The worst-case sagitta over the whole patch also inflates
+    // box_, for the same reason at the BVH broad-phase level.
+    void compute_cell_padding() {
+        const int n = coarse_.n;
+        const int cells = (n - 1) * (n - 1);
+        coarse_.cell_sagitta.assign(cells, 0.0);
+        coarse_.cell_normal.assign(cells, Vec3{ 0.0, 0.0, 0.0 });
+
+        std::vector<double> lu, lv;
+        double max_sagitta = 0.0;
+
+        for (int i = 0; i + 1 < n; ++i) {
+            for (int j = 0; j + 1 < n; ++j) {
+                const double u_mid = 0.5 * (coarse_.u[i] + coarse_.u[i + 1]);
+                const double v_mid = 0.5 * (coarse_.v[j] + coarse_.v[j + 1]);
+
+                lagrange_basis_1d(data_.uNodes, data_.uWeights, u_mid, lu);
+                lagrange_basis_1d(data_.vNodes, data_.vWeights, v_mid, lv);
+
+                Vec3 true_mid = { eval_scalar_field(lu, lv, data_.x),
+                                   eval_scalar_field(lu, lv, data_.y),
+                                   eval_scalar_field(lu, lv, data_.z) };
+                Vec3 normal_mid = vec_normalize({ eval_scalar_field(lu, lv, data_.nuX),
+                                                   eval_scalar_field(lu, lv, data_.nuY),
+                                                   eval_scalar_field(lu, lv, data_.nuZ) });
+
+                const Vec3 p00 = coarse_.point(i,     j);
+                const Vec3 p10 = coarse_.point(i + 1, j);
+                const Vec3 p01 = coarse_.point(i,     j + 1);
+                const Vec3 p11 = coarse_.point(i + 1, j + 1);
+                const Vec3 bilinear_mid = { 0.25 * (p00.x + p10.x + p01.x + p11.x),
+                                             0.25 * (p00.y + p10.y + p01.y + p11.y),
+                                             0.25 * (p00.z + p10.z + p01.z + p11.z) };
+
+                const Vec3 diff = vec_sub(true_mid, bilinear_mid);
+                const double sagitta = std::sqrt(vec_dot(diff, diff));
+
+                const int idx = coarse_.cell_index(i, j);
+                coarse_.cell_sagitta[idx] = sagitta;
+                coarse_.cell_normal[idx] = normal_mid;
+                max_sagitta = std::max(max_sagitta, sagitta);
+            }
+        }
+
+        box_.min.x -= max_sagitta; box_.min.y -= max_sagitta; box_.min.z -= max_sagitta;
+        box_.max.x += max_sagitta; box_.max.y += max_sagitta; box_.max.z += max_sagitta;
+
+        max_sagitta_ = max_sagitta;
     }
 
     // (u,v) centroid of one coarse-grid triangle, straight from the coarse
