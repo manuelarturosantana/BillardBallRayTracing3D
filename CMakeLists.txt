@@ -29,34 +29,63 @@ target_link_libraries(triangle_intersect_test PRIVATE raytracer)
 
 add_test(NAME TriangleIntersect COMMAND triangle_intersect_test)
 
-# --- trace_scene: SurfacePatch-driven ray tracing example -------------------
+# --- SurfacePatch-driven executables ----------------------------------------
 # SurfacePatch.hpp (via Utils/PatchInterpolation.hpp) needs MKL for
-# cblas_dgemm, mirroring IFGF-RP's own global.h. Only build this target when
-# an MKL install can actually be found, so the Triangle-only library and its
-# test above keep configuring on machines without oneAPI installed.
-if(DEFINED ENV{MKLROOT})
-    add_executable(trace_scene src/main.cpp)
-    target_link_libraries(trace_scene PRIVATE raytracer)
+# cblas_dgemm, mirroring IFGF-RP's own global.h. Only build these targets
+# when an MKL install can actually be found, so the Triangle-only library and
+# its test above keep configuring on machines without oneAPI installed.
 
-    target_include_directories(trace_scene PRIVATE $ENV{MKLROOT}/include)
-    target_link_directories(trace_scene PRIVATE $ENV{MKLROOT}/lib/intel64)
-    target_link_libraries(trace_scene PRIVATE
+find_package(OpenMP)
+
+# Shared MKL/MPI/OpenMP/filesystem setup for any target that transitively
+# includes SurfacePatch.hpp — factored out so trace_scene and
+# bounce_map_example (and any future one) don't repeat it.
+function(configure_surface_patch_target target)
+    target_include_directories(${target} PRIVATE $ENV{MKLROOT}/include)
+    target_link_directories(${target} PRIVATE $ENV{MKLROOT}/lib/intel64)
+    target_link_libraries(${target} PRIVATE
         mkl_intel_lp64
         mkl_sequential
         mkl_core
     )
 
-    # mpi.h is included (unused) by Utils/PatchInterpolation.hpp; only its
-    # headers are needed here since nothing in this project calls into MPI.
+    # mpi.h is included (unused) by Utils/PatchInterpolation.hpp; only
+    # its headers are needed here since nothing in this project calls
+    # into MPI.
     if(DEFINED ENV{I_MPI_ROOT})
-        target_include_directories(trace_scene PRIVATE $ENV{I_MPI_ROOT}/include)
+        target_include_directories(${target} PRIVATE $ENV{I_MPI_ROOT}/include)
     endif()
 
-    # RayTracingDriver.hpp uses std::filesystem; GCC < 9 needs an explicit
-    # -lstdc++fs. Harmless no-op on every other toolchain.
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
-        target_link_libraries(trace_scene PRIVATE stdc++fs)
+    # BounceMapDriver.hpp and PlaneSourceDriver.hpp each parallelize their
+    # own hot loop with a #pragma omp parallel for; link OpenMP when
+    # available so that actually runs multi-threaded (harmless on targets
+    # that use neither — the pragma just doesn't appear there).
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX)
+    else()
+        message(STATUS "OpenMP not found — ${target} will build without parallelizing its sweep")
     endif()
-else()
-    message(STATUS "MKLROOT not set — skipping trace_scene target (SurfacePatch needs MKL for Lagrange interpolation)")
-endif()
+
+    # RayTracingDriver.hpp uses std::filesystem; GCC < 9 needs an
+    # explicit -lstdc++fs. Harmless no-op on every other toolchain.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
+        target_link_libraries(${target} PRIVATE stdc++fs)
+    endif()
+endfunction()
+
+add_executable(trace_scene src/main.cpp)
+target_link_libraries(trace_scene PRIVATE raytracer)
+configure_surface_patch_target(trace_scene)
+
+# bounce_map_example: BounceMapDriver usage example (tests/BounceMap_Example.cpp)
+# — not a pass/fail test (no ground truth to assert against), just a
+# runnable example, mirroring how trace_scene exercises RayTracingDriver.
+add_executable(bounce_map_example tests/BounceMap_Example.cpp)
+target_link_libraries(bounce_map_example PRIVATE raytracer)
+configure_surface_patch_target(bounce_map_example)
+
+# plane_source_example: PlaneSourceDriver usage example (tests/PlaneSource_Example.cpp)
+# — likewise not a pass/fail test, just a runnable example.
+add_executable(plane_source_example tests/PlaneSource_Example.cpp)
+target_link_libraries(plane_source_example PRIVATE raytracer)
+configure_surface_patch_target(plane_source_example)

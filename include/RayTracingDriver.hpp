@@ -12,6 +12,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // --- RayTracingDriver --------------------------------------------------------
@@ -45,6 +46,12 @@
 //     smaller than that can leave the next ray still inside the padded
 //     shell, re-detecting the same point and getting stuck bouncing in place.
 //
+// trace_ray() and self_intersect_epsilon() are public (not just used
+// internally by run()) so other drivers built on top of this one — e.g.
+// BounceMapDriver, which generates its own ray origins directly on a
+// patch's surface rather than going through set_rays() — can reuse the same
+// tracing and self-intersection-safe launch logic instead of duplicating it.
+//
 // Like SurfacePatch.hpp, this pulls in MKL/MPI/OpenMP transitively via
 // Utils/PatchInterpolation.hpp — see SurfacePatch.hpp's header comment.
 class RayTracingDriver {
@@ -58,6 +65,16 @@ public:
         Status status = Status::Trapped;
         int bounce_count = 0;       // number of surface hits actually recorded
         std::string error_message;  // populated only when status == Error
+
+        // Which patch (as a ScatObject*) each recorded bounce hit, in the
+        // same order as bounces happen — hit_objects[k] is the patch that
+        // produced points[k+1] (points[0] is always the source, which isn't
+        // a hit on anything). NOT extended with an entry for an escaping
+        // ray's synthetic tail point. Populated by trace_ray() using the
+        // Hit::object BVH::intersect() tags each hit with; callers that
+        // need per-patch hit counts (e.g. PlaneSourceDriver) read this
+        // instead of re-deriving identity some other way.
+        std::vector<const ScatObject*> hit_objects;
     };
 
     // Loads every "*.txt" regular file in `patch_directory` as a
@@ -65,6 +82,25 @@ public:
     // directory doesn't exist, has no patches, or a patch file is malformed.
     explicit RayTracingDriver(const std::string& patch_directory) {
         load_patches(patch_directory);
+        build_bvh();
+        compute_scene_scale();
+    }
+
+    // Loads exactly the files "<directory><file_prefix><i>.txt" for i in
+    // [first_index_1based, last_index_1based] inclusive — 1-based, matching
+    // the on-disk naming IFGF-RP itself uses (`directory` should include
+    // its own trailing slash). Unlike the directory-scanning constructor
+    // above, this builds paths directly rather than scanning + sorting: a
+    // lexicographic sort of filenames does NOT match numeric order once
+    // indices hit two digits (e.g. "-10.txt" sorts before "-2.txt"), which
+    // would silently scramble which index means which file. Throws if the
+    // range is empty/invalid or any file in it is missing/malformed (same
+    // fail-loud behavior as the other constructor).
+    RayTracingDriver(const std::string& directory,
+                      const std::string& file_prefix,
+                      int first_index_1based,
+                      int last_index_1based) {
+        load_patches_range(directory, file_prefix, first_index_1based, last_index_1based);
         build_bvh();
         compute_scene_scale();
     }
@@ -101,12 +137,102 @@ public:
         paths_.reserve(sources_.size());
 
         for (size_t i = 0; i < sources_.size(); ++i) {
-            paths_.push_back(trace_one_ray(sources_[i], directions_[i], max_bounces));
+            paths_.push_back(trace_ray(sources_[i], directions_[i], max_bounces));
         }
     }
 
     const std::vector<RayPath>& paths() const { return paths_; }
     const std::vector<std::unique_ptr<SurfacePatch>>& patches() const { return patches_; }
+
+    // Maps a hit's Hit::object (as recorded in RayPath::hit_objects) back to
+    // its index into patches(). Returns -1 for a pointer this driver didn't
+    // load (shouldn't happen for a Hit produced by this driver's own BVH,
+    // but checked rather than assumed). Built once, right after loading.
+    long long patch_index_of(const ScatObject* object) const {
+        auto it = patch_index_by_ptr_.find(object);
+        return it != patch_index_by_ptr_.end() ? static_cast<long long>(it->second) : -1;
+    }
+
+    // Traces a single ray from an explicit (origin, direction): bounces
+    // specularly off whatever it hits until it escapes the scene, hits
+    // `max_bounces` without escaping (Trapped), or a patch intersection
+    // throws (Error, recorded on the returned path rather than propagated —
+    // this method never throws for that reason). `direction` need not be
+    // pre-normalized; a zero-length one comes back as an Error path rather
+    // than throwing, since (unlike set_rays()) this is a per-call, not a
+    // batch-setup, entry point.
+    RayPath trace_ray(const Vec3& origin, const Vec3& direction, int max_bounces) const {
+        RayPath path;
+        path.points.push_back(origin);
+
+        const double len2 = direction.x * direction.x + direction.y * direction.y + direction.z * direction.z;
+        if (len2 < 1e-300) {
+            path.status = RayPath::Status::Error;
+            path.error_message = "RayTracingDriver::trace_ray: zero-length direction";
+            return path;
+        }
+
+        Vec3 origin_pt = origin;
+        Vec3 dir = normalize_dir(direction);
+
+        for (int bounce = 0; bounce < max_bounces; ++bounce) {
+            Ray ray{ origin_pt, dir };
+            std::optional<Hit> hit;
+
+            try {
+                hit = bvh_->intersect(ray);
+            } catch (const std::exception& e) {
+                path.status = RayPath::Status::Error;
+                path.error_message = e.what();
+                return path;
+            }
+
+            if (!hit) {
+                path.status = RayPath::Status::Escaped;
+                path.points.push_back({ origin_pt.x + dir.x * scene_diagonal_,
+                                         origin_pt.y + dir.y * scene_diagonal_,
+                                         origin_pt.z + dir.z * scene_diagonal_ });
+                return path;
+            }
+
+            path.points.push_back(hit->point);
+            path.hit_objects.push_back(hit->object);
+            path.bounce_count++;
+
+            dir = reflect(dir, hit->normal);
+
+            const double eps = self_intersect_epsilon(hit->object);
+            origin_pt = { hit->point.x + dir.x * eps,
+                          hit->point.y + dir.y * eps,
+                          hit->point.z + dir.z * eps };
+        }
+
+        path.status = RayPath::Status::Trapped;
+        return path;
+    }
+
+    // The minimum safe distance to nudge a new ray's origin away from a
+    // surface point it's leaving (after a bounce, or — for a caller
+    // launching rays directly from a patch's surface, like BounceMapDriver —
+    // at the very start) so the next intersect() call can't re-detect that
+    // same point through that object's curvature-padded stage-1 test.
+    //
+    // `leaving_object` should be the specific patch the ray is leaving (a
+    // bounce's hit->object, or the patch a caller is launching straight off
+    // of) — its own self_intersect_padding() is what matters, NOT the
+    // worst-case padding anywhere else in the scene. Pass nullptr only when
+    // no specific object applies (e.g. a source with no proximate surface);
+    // that falls back to the scene-wide max_patch_sagitta_, which is
+    // conservative but can over-nudge a low-curvature patch sitting in a
+    // scene that also contains a high-curvature one — see
+    // ScatObject::self_intersect_padding()'s comment for why a scene-wide
+    // value isn't used as the general case.
+    double self_intersect_epsilon(const ScatObject* leaving_object = nullptr) const {
+        const double padding = leaving_object ? leaving_object->self_intersect_padding()
+                                               : max_patch_sagitta_;
+        return std::max(kSelfIntersectEpsilonFactor * scene_diagonal_,
+                         kSagittaClearanceFactor * padding);
+    }
 
     // Writes every traced path as legacy ASCII VTK PolyData: one 2-point
     // LINE cell per bounce leg, with per-cell RayID/BounceIndex scalars so
@@ -163,6 +289,7 @@ private:
     std::vector<Vec3> directions_;
     std::vector<RayPath> paths_;
     double max_patch_sagitta_ = 0.0;
+    std::unordered_map<const ScatObject*, size_t> patch_index_by_ptr_;
 
     // Fraction of the scene diagonal used as a floor under the self-
     // intersection nudge, for the degenerate case where every patch is
@@ -211,7 +338,11 @@ private:
     void build_bvh() {
         std::vector<const ScatObject*> objects;
         objects.reserve(patches_.size());
-        for (const auto& patch : patches_) objects.push_back(patch.get());
+        patch_index_by_ptr_.reserve(patches_.size());
+        for (size_t i = 0; i < patches_.size(); ++i) {
+            objects.push_back(patches_[i].get());
+            patch_index_by_ptr_[patches_[i].get()] = i;
+        }
         bvh_ = std::make_unique<BVH>(std::move(objects));
     }
 
@@ -239,46 +370,19 @@ private:
         return { d.x - 2.0 * dn * n.x, d.y - 2.0 * dn * n.y, d.z - 2.0 * dn * n.z };
     }
 
-    RayPath trace_one_ray(const Vec3& source, const Vec3& direction, int max_bounces) const {
-        RayPath path;
-        path.points.push_back(source);
-
-        Vec3 origin = source;
-        Vec3 dir = normalize_dir(direction);   // non-zero guaranteed by set_rays()
-
-        for (int bounce = 0; bounce < max_bounces; ++bounce) {
-            Ray ray{ origin, dir };
-            std::optional<Hit> hit;
-
-            try {
-                hit = bvh_->intersect(ray);
-            } catch (const std::exception& e) {
-                path.status = RayPath::Status::Error;
-                path.error_message = e.what();
-                return path;
-            }
-
-            if (!hit) {
-                path.status = RayPath::Status::Escaped;
-                path.points.push_back({ origin.x + dir.x * scene_diagonal_,
-                                         origin.y + dir.y * scene_diagonal_,
-                                         origin.z + dir.z * scene_diagonal_ });
-                return path;
-            }
-
-            path.points.push_back(hit->point);
-            path.bounce_count++;
-
-            dir = reflect(dir, hit->normal);
-
-            const double eps = std::max(kSelfIntersectEpsilonFactor * scene_diagonal_,
-                                         kSagittaClearanceFactor * max_patch_sagitta_);
-            origin = { hit->point.x + dir.x * eps,
-                       hit->point.y + dir.y * eps,
-                       hit->point.z + dir.z * eps };
+    void load_patches_range(const std::string& directory, const std::string& file_prefix,
+                             int first_index_1based, int last_index_1based) {
+        if (last_index_1based < first_index_1based) {
+            throw std::invalid_argument(
+                "RayTracingDriver: empty patch index range [" + std::to_string(first_index_1based) +
+                ", " + std::to_string(last_index_1based) + "]");
         }
 
-        path.status = RayPath::Status::Trapped;
-        return path;
+        patches_.reserve(static_cast<size_t>(last_index_1based - first_index_1based + 1));
+        for (int i = first_index_1based; i <= last_index_1based; ++i) {
+            // SurfacePatch's constructor throws on a missing/malformed file
+            // — that propagates straight out of here, failing the whole load.
+            patches_.push_back(std::make_unique<SurfacePatch>(directory + file_prefix + std::to_string(i) + ".txt"));
+        }
     }
 };

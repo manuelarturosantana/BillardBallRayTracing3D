@@ -152,6 +152,72 @@ public:
     // from the midpoint this won't work. With well resolved patches this should be fine though.
     double max_sagitta() const { return max_sagitta_; }
 
+    // ScatObject's per-object self-intersection clearance — this patch's own
+    // worst-case sagitta, not any scene-wide value. See ScatObject::
+    // self_intersect_padding() and RayTracingDriver::self_intersect_epsilon().
+    double self_intersect_padding() const override { return max_sagitta_; }
+
+    // A general-purpose n x n sampling of the patch surface (position AND
+    // unit normal) over the reference square [-1,1] x [-1,1], via Lagrange
+    // interpolation — independent of, and typically a different resolution
+    // than, the internal coarse_ grid intersect() uses for hit-testing.
+    // Callers that want to sample the patch itself (e.g. to launch rays
+    // from its surface, as BounceMapDriver does) should use this, not
+    // coarse_grid().
+    struct SampledGrid {
+        int n = 0;
+        std::vector<double> u, v;         // size n each, equally spaced in [-1,1]
+        std::vector<double> x, y, z;      // size n*n, row-major: idx = i*n + j
+        std::vector<double> nx, ny, nz;   // size n*n, unit normal at each point
+
+        Vec3 point(int i, int j) const {
+            int idx = i * n + j;
+            return { x[idx], y[idx], z[idx] };
+        }
+        Vec3 normal(int i, int j) const {
+            int idx = i * n + j;
+            return { nx[idx], ny[idx], nz[idx] };
+        }
+    };
+
+    SampledGrid sample_grid(int n) const {
+        SampledGrid g;
+        g.n = n;
+        g.u.resize(n);
+        g.v.resize(n);
+        for (int i = 0; i < n; ++i) {
+            const double t = (n == 1) ? 0.0 : -1.0 + 2.0 * static_cast<double>(i) / (n - 1);
+            g.u[i] = t;
+            g.v[i] = t;
+        }
+
+        const size_t nn = static_cast<size_t>(n) * n;
+        g.x.resize(nn);  g.y.resize(nn);  g.z.resize(nn);
+        g.nx.resize(nn); g.ny.resize(nn); g.nz.resize(nn);
+
+        lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
+                                   data_.x, g.u, g.v, g.x.data());
+        lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
+                                   data_.y, g.u, g.v, g.y.data());
+        lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
+                                   data_.z, g.u, g.v, g.z.data());
+        lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
+                                   data_.nuX, g.u, g.v, g.nx.data());
+        lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
+                                   data_.nuY, g.u, g.v, g.ny.data());
+        lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
+                                   data_.nuZ, g.u, g.v, g.nz.data());
+
+        // Lagrange-interpolating a unit vector field doesn't generally
+        // preserve unit length; renormalize per point.
+        for (size_t k = 0; k < nn; ++k) {
+            const Vec3 nrm = vec_normalize({ g.nx[k], g.ny[k], g.nz[k] });
+            g.nx[k] = nrm.x; g.ny[k] = nrm.y; g.nz[k] = nrm.z;
+        }
+
+        return g;
+    }
+
     // Stage 1: brute-force test against the coarse grid. Each grid square
     // (i,j)-(i+1,j)-(i,j+1)-(i+1,j+1) is split into two triangles; since the
     // true patch is curved and the coarse mesh is flat, a real crossing can
