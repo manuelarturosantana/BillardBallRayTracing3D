@@ -1,6 +1,0 @@
-Tue Sep 15 09:25:30 PDT 2026
-Running on wavefield-02-02.cluster
-direction 0.866025 0 -0.5
-Traced 1081600 source points (1040x1040) across 4212 patches
-Wrote patch hit counts to /scratch/msantana/RayTracing/Plane_by_Plane.vtk
-Tue Sep 15 09:28:43 PDT 2026

@@ -93,8 +93,10 @@ public:
 
         patch_grids_.clear();
         patch_max_bounces_.clear();
+        patch_error_counts_.clear();
         patch_grids_.reserve(sample_patches_.size());
         patch_max_bounces_.reserve(sample_patches_.size());
+        patch_error_counts_.reserve(sample_patches_.size());
 
         const size_t num_patches = sample_patches_.size();
         for (size_t patch_num = 0; patch_num < num_patches; ++patch_num) {
@@ -108,6 +110,14 @@ public:
             SurfacePatch::SampledGrid grid = patch->sample_grid(position_grid_n);
             const long long nn = static_cast<long long>(grid.x.size());
             std::vector<int> max_bounces_at_point(static_cast<size_t>(nn), 0);
+            // Diagnostic: how many of this point's theta_n*phi_n directions
+            // came back Error (skipped, uncounted toward `best`) rather than
+            // Escaped/Trapped. A point reading MaxBounces == 0 is ambiguous
+            // on its own — it could be a ray that genuinely escaped
+            // immediately, or one where every direction errored out and
+            // `best` never left its initial 0. Written out alongside
+            // MaxBounces so the two can be told apart in ParaView.
+            std::vector<int> error_count_at_point(static_cast<size_t>(nn), 0);
 
             // Progress bar for this patch's grid-point sweep: each thread
             // bumps a shared atomic counter as it finishes a point and
@@ -124,9 +134,10 @@ public:
                 const size_t idx = static_cast<size_t>(k);
                 const Vec3 point = { grid.x[idx], grid.y[idx], grid.z[idx] };
                 const Vec3 normal = vec_normalize({ grid.nx[idx], grid.ny[idx], grid.nz[idx] });
+                const Vec3 du = { grid.dxdu[idx], grid.dydu[idx], grid.dzdu[idx] };
 
                 Vec3 t1, t2;
-                build_tangent_frame(normal, t1, t2);
+                build_tangent_frame(normal, du, t1, t2);
 
                 // Launch from just off the surface along the outward normal
                 // — reuses the same nudge RayTracingDriver sizes off this
@@ -137,6 +148,7 @@ public:
                                        point.z + normal.z * eps };
 
                 int best = 0;
+                int n_errors = 0;
                 for (int ti = 0; ti < theta_n; ++ti) {
                     // Solid-angle-uniform, cell-centered in cos(theta): mu is
                     // strictly inside (0,1), so theta never lands exactly on
@@ -157,12 +169,14 @@ public:
 
                         const RayTracingDriver::RayPath path = driver_.trace_ray(origin, dir, max_bounces);
                         if (path.status == RayTracingDriver::RayPath::Status::Error) {
+                            ++n_errors;
                             continue;  // skip this direction, keep going
                         }
                         best = std::max(best, path.bounce_count);
                     }
                 }
                 max_bounces_at_point[idx] = best;
+                error_count_at_point[idx] = n_errors;
 
                 const long long done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (done % print_every == 0 || done == nn) {
@@ -176,6 +190,7 @@ public:
 
             patch_grids_.push_back(std::move(grid));
             patch_max_bounces_.push_back(std::move(max_bounces_at_point));
+            patch_error_counts_.push_back(std::move(error_count_at_point));
         }
     }
 
@@ -192,18 +207,21 @@ public:
 
         std::vector<Vec3> all_points;
         std::vector<int> all_bounces;
+        std::vector<int> all_errors;
         struct Tri { int a, b, c; };
         std::vector<Tri> tris;
 
         for (size_t p = 0; p < patch_grids_.size(); ++p) {
             const auto& grid = patch_grids_[p];
             const auto& bounces = patch_max_bounces_[p];
+            const auto& errors = patch_error_counts_[p];
             const int n = grid.n;
             const int base = static_cast<int>(all_points.size());
 
             for (int idx = 0; idx < n * n; ++idx) {
                 all_points.push_back({ grid.x[idx], grid.y[idx], grid.z[idx] });
                 all_bounces.push_back(bounces[idx]);
+                all_errors.push_back(errors[idx]);
             }
 
             // Same diagonal split as SurfacePatch::intersect()'s coarse grid:
@@ -243,6 +261,13 @@ public:
         out << "POINT_DATA " << all_points.size() << '\n';
         out << "SCALARS MaxBounces int 1\nLOOKUP_TABLE default\n";
         for (int b : all_bounces) out << b << '\n';
+        // Diagnostic: how many of this point's hemisphere directions errored
+        // out (skipped, uncounted toward MaxBounces) rather than legitimately
+        // escaping or getting trapped — see run()'s comment. A high count
+        // here alongside MaxBounces == 0 means "most rays failed to trace",
+        // not "this point genuinely has no bounces".
+        out << "SCALARS ErrorCount int 1\nLOOKUP_TABLE default\n";
+        for (int e : all_errors) out << e << '\n';
     }
 
     const RayTracingDriver& driver() const { return driver_; }
@@ -252,9 +277,15 @@ private:
     std::vector<std::unique_ptr<SurfacePatch>> sample_patches_; // just the range being sampled
     std::vector<SurfacePatch::SampledGrid> patch_grids_;
     std::vector<std::vector<int>> patch_max_bounces_;
+    std::vector<std::vector<int>> patch_error_counts_;  // parallel to patch_max_bounces_; see run()
 
     static constexpr double kTwoPi = 6.283185307179586476925286766559;
     static constexpr int kProgressBarWidth = 30;
+
+    // Relative tolerance for build_tangent_frame()'s degenerate-du fallback:
+    // below this fraction of |du| itself, du is treated as (numerically)
+    // parallel to the normal rather than trusted as a tangent direction.
+    static constexpr double kTangentDegenerateRelTol = 1e-6;
 
     // Redraws a single-line progress bar in place (via '\r', no newline) for
     // the grid-point sweep of patch `patch_num_1based` out of `num_patches`.
@@ -295,16 +326,50 @@ private:
         }
     }
 
-    // Builds an arbitrary orthonormal tangent frame (t1, t2) perpendicular
-    // to unit normal n, via the usual "least-aligned coordinate axis"
-    // cross-product trick. The azimuth reference this picks is arbitrary —
-    // harmless here since run() sweeps the full phi range at every point and
-    // only the max bounce count over all directions is kept.
-    static void build_tangent_frame(const Vec3& n, Vec3& t1, Vec3& t2) {
-        const Vec3 a = (std::fabs(n.x) <= std::fabs(n.y) && std::fabs(n.x) <= std::fabs(n.z))
-                           ? Vec3{ 1.0, 0.0, 0.0 }
-                           : (std::fabs(n.y) <= std::fabs(n.z) ? Vec3{ 0.0, 1.0, 0.0 } : Vec3{ 0.0, 0.0, 1.0 });
-        t1 = vec_normalize(vec_cross(n, a));
+    // Builds an orthonormal tangent frame (t1, t2) perpendicular to unit
+    // normal n, with t1 the patch's own dX/du direction (`du`) projected
+    // orthogonal to n and normalized — NOT picked off the global x/y/z axes.
+    //
+    // This matters because the hemisphere t1/t2 anchors is only swept
+    // CONTINUOUSLY over the full phi range in the limit; run() actually
+    // samples a finite theta_n x phi_n grid relative to this frame. A
+    // reference axis chosen by comparing n against the global axes (the
+    // previous approach) flips depending on which way the patch happens to
+    // be rotated in the scene, even though the patch's own geometry hasn't
+    // changed — silently handing two placements of the same patch two
+    // different discrete direction sets. Billiard-ball bouncing is chaotic
+    // enough that a different discrete direction set can produce noticeably
+    // different bounce/error statistics even for an identical patch, purely
+    // because of how it's oriented in world space. Building t1 from the
+    // patch's own dX/du instead makes the sampled directions a property of
+    // the surface, not of its placement, so run()'s results for a given
+    // patch no longer depend on translation/rotation of the scene.
+    //
+    // Falls back to the old global-axis trick only in the degenerate case
+    // where `du` is (numerically) parallel to n or zero-length — e.g. at a
+    // parametrization singularity. At that one point, which axis gets
+    // picked is genuinely arbitrary (there's no well-defined tangent
+    // direction to be intrinsic to), so reproducibility isn't on the table
+    // there anyway.
+    static void build_tangent_frame(const Vec3& n, const Vec3& du, Vec3& t1, Vec3& t2) {
+        const double du_len2 = vec_dot(du, du);
+        const double du_dot_n = vec_dot(du, n);
+        const Vec3 du_perp = { du.x - du_dot_n * n.x, du.y - du_dot_n * n.y, du.z - du_dot_n * n.z };
+        const double du_perp_len2 = vec_dot(du_perp, du_perp);
+
+        // Relative test (du_perp vs. du itself, not an absolute length)
+        // so it works regardless of this patch's own dX/du scale. Written
+        // as a product comparison rather than a ratio so du_len2 == 0
+        // (du_perp_len2 is then 0 too) falls straight into the fallback
+        // instead of a 0/0 division.
+        if (du_perp_len2 > kTangentDegenerateRelTol * kTangentDegenerateRelTol * du_len2) {
+            t1 = vec_normalize(du_perp);
+        } else {
+            const Vec3 a = (std::fabs(n.x) <= std::fabs(n.y) && std::fabs(n.x) <= std::fabs(n.z))
+                               ? Vec3{ 1.0, 0.0, 0.0 }
+                               : (std::fabs(n.y) <= std::fabs(n.z) ? Vec3{ 0.0, 1.0, 0.0 } : Vec3{ 0.0, 0.0, 1.0 });
+            t1 = vec_normalize(vec_cross(n, a));
+        }
         t2 = vec_cross(n, t1);  // unit already: n, t1 are orthonormal unit vectors
     }
 };

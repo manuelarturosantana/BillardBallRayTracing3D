@@ -52,7 +52,7 @@
 class SurfacePatch : public ScatObject {
 public:
     // Raw patch data, exactly as it comes off disk. Flat arrays are stored
-    // in the file's order: index = i + imax*(j + jmax*k), with k the fast
+    // in the file's order: 
     // ... actually the file lists x, then y, then z, each as imax*jmax*kmax
     // values in the order they were written by the generator. We keep them
     // flat and untouched; helpers below index them.
@@ -169,6 +169,18 @@ public:
         std::vector<double> u, v;         // size n each, equally spaced in [-1,1]
         std::vector<double> x, y, z;      // size n*n, row-major: idx = i*n + j
         std::vector<double> nx, ny, nz;   // size n*n, unit normal at each point
+        // dX/du at each point — NOT unit length, NOT (in general) exactly
+        // tangent-plane-orthogonal to (nx,ny,nz) after interpolation, but a
+        // patch-intrinsic direction (the u-parameter direction, as embedded
+        // in the actual surface geometry) that a caller can build a
+        // reproducible local tangent frame from — see BounceMapDriver's
+        // build_tangent_frame(), which projects this orthogonal to the
+        // normal instead of picking a reference off the global x/y/z axes,
+        // so the frame (and anything sampled relative to it, like a
+        // hemisphere of directions) depends only on the patch's own
+        // geometry, not on how the patch happens to be placed/oriented in
+        // the scene.
+        std::vector<double> dxdu, dydu, dzdu;
 
         Vec3 point(int i, int j) const {
             int idx = i * n + j;
@@ -177,6 +189,10 @@ public:
         Vec3 normal(int i, int j) const {
             int idx = i * n + j;
             return { nx[idx], ny[idx], nz[idx] };
+        }
+        Vec3 tangent_u(int i, int j) const {
+            int idx = i * n + j;
+            return { dxdu[idx], dydu[idx], dzdu[idx] };
         }
     };
 
@@ -194,6 +210,7 @@ public:
         const size_t nn = static_cast<size_t>(n) * n;
         g.x.resize(nn);  g.y.resize(nn);  g.z.resize(nn);
         g.nx.resize(nn); g.ny.resize(nn); g.nz.resize(nn);
+        g.dxdu.resize(nn); g.dydu.resize(nn); g.dzdu.resize(nn);
 
         lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
                                    data_.x, g.u, g.v, g.x.data());
@@ -207,6 +224,12 @@ public:
                                    data_.nuY, g.u, g.v, g.ny.data());
         lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
                                    data_.nuZ, g.u, g.v, g.nz.data());
+        lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
+                                   data_.dxdu, g.u, g.v, g.dxdu.data());
+        lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
+                                   data_.dydu, g.u, g.v, g.dydu.data());
+        lagrange_interpolation_2D(data_.uNodes, data_.vNodes, data_.uWeights, data_.vWeights,
+                                   data_.dzdu, g.u, g.v, g.dzdu.data());
 
         // Lagrange-interpolating a unit vector field doesn't generally
         // preserve unit length; renormalize per point.

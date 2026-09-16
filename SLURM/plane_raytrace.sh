@@ -20,7 +20,8 @@ echo "Running on $(hostname)"
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
-srun --cpu-bind=cores ../build/plane_source_example /scratch/msantana/PatchFoldersRefined/PlaneWithNacelleMoreRefinedReordered/ /scratch/msantana/RayTracing/Plane_by_Plane.vtk
+#srun --cpu-bind=cores ../build/plane_source_example /scratch/msantana/PatchFoldersRefined/PlaneWithNacelleMoreRefinedReordered/ /scratch/msantana/RayTracing/Plane_by_Plane.vtk
+srun --cpu-bind=cores ../build/plane_source_example /scratch/msantana/PatchFoldersRefined/deleteme/ /scratch/msantana/RayTracing/Plane_by_Plane.vtk
 date
 
 

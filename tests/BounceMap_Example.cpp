@@ -19,22 +19,26 @@ int main(int argc, char** argv) {
     // part of the traced scene (BounceMapDriver loads the whole directory
     // for the BVH), but only the [first_index, last_index] range below is
     // actually sampled (grid points + launch directions).
+    // std::string patch_directory =
+    //     (argc > 1) ? argv[1] : "/scratch/msantana/PatchFolders/Nacelle/";
+    // std::string patch_directory =
+    //     (argc > 1) ? argv[1] : "/scratch/msantana/PatchFoldersRefined/PlaneWithNacelleRefinedReordered/";
     std::string patch_directory =
-        (argc > 1) ? argv[1] : "/scratch/msantana/PatchFolders/Nacelle/";
-    std::string file_prefix = (argc > 2) ? argv[2] : "Nacelle-";
+        (argc > 1) ? argv[1] : "/scratch/msantana/PatchFoldersRefined/deleteme/";
+    std::string file_prefix = (argc > 2) ? argv[2] : "patch_";
     int first_index = (argc > 3) ? std::stoi(argv[3]) : 1;
     int last_index  = (argc > 4) ? std::stoi(argv[4]) : 134;
 
     // Output VTK PolyData surface — open it in ParaView and color by
     // "MaxBounces" to see the bounce map.
     std::string output_vtk =
-        (argc > 5) ? argv[5] : "/scratch/msantana/RayTracing/bounce_map.vtk";
+        (argc > 5) ? argv[5] : "/scratch/msantana/RayTracing/bounce_map2.vtk";
 
     // --- Sampling resolution ---------------------------------------------
-    const int position_grid_n = 5;  // n x n position samples per patch
-    const int theta_n = 5;           // polar-angle (solid-angle-uniform) samples
-    const int phi_n = 8;            // azimuth samples
-    const int max_bounces = 300;     // per-direction bounce cap (Trapped beyond this)
+    const int position_grid_n = 6;  // n x n position samples per patch
+    const int theta_n = 6;           // polar-angle (solid-angle-uniform) samples
+    const int phi_n = 9;            // azimuth samples
+    const int max_bounces = 100;     // per-direction bounce cap (Trapped beyond this)
 
     try {
         BounceMapDriver driver(patch_directory, file_prefix, first_index, last_index);

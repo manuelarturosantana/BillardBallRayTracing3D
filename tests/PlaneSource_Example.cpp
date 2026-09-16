@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
     // Directory of IFGF-RP patch ".txt" files — every patch in here is part
     // of the traced scene, and every patch is written out (hit or not).
     std::string patch_directory =
-        (argc > 1) ? argv[1] : "/scratch/msantana/PatchFolders/Nacelle/";
+        (argc > 1) ? argv[1] : "/scratch/msantana/PatchFoldersRefined/PlaneWithNacelleRefinedReordered/";
 
     // Output VTK PolyData surface — open it in ParaView and color by
     // "HitCount" to see which patches got illuminated.
@@ -53,8 +53,8 @@ static const double PHI = 2.0 * M_PI / 3.0;  // polar,   in [0, pi]
 
     std::cout << "direction " << direction.x << " " << direction.y << " " << direction.z << std::endl;
     // nx and ny are ordered according to the axis order.
-    const int nx = 1040;
-    const int ny = 1040;
+    const int nx = 3040;
+    const int ny = 3040;
 
     const int max_bounces = 300;  // per-ray bounce cap (Trapped beyond this)
 
