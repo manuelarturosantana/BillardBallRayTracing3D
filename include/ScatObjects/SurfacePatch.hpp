@@ -114,7 +114,7 @@ public:
         int cell_index(int i, int j) const { return i * (n - 1) + j; }
     };
 
-    static constexpr int kCoarseGridSize = 40;
+    static constexpr int kCoarseGridSize = 100;
 
     // Newton refinement (stage 2 of intersect()): iteration cap and the
     // convergence tolerance on the (u,v,t) update's step size, per iteration.

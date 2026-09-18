@@ -3,6 +3,7 @@
 #include "BVH.hpp"
 #include "ScatObject.hpp"
 #include "ScatObjects/SurfacePatch.hpp"
+#include "Utils/MollerTrumbore.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -44,7 +45,14 @@
 //     max_sagitta()), not an arbitrary tiny constant — that padding tests
 //     triangles pushed off the true surface by up to +-sagitta, so a nudge
 //     smaller than that can leave the next ray still inside the padded
-//     shell, re-detecting the same point and getting stuck bouncing in place.
+//     shell, re-detecting the same point and getting stuck bouncing in place;
+//   - every patch's stored normal is outward-pointing by construction, so
+//     trace_ray() treats a hit whose incoming direction has a non-negative
+//     dot product with that normal (past a small tolerance) as an Error: it
+//     means the ray struck the surface's back face, which only happens if
+//     it already tunneled through a gap in some patch's triangulated
+//     stage-1 test (most likely at a high-curvature patch that's still
+//     under-tessellated) and is now traveling inside the solid.
 //
 // trace_ray() and self_intersect_epsilon() are public (not just used
 // internally by run()) so other drivers built on top of this one — e.g.
@@ -195,6 +203,28 @@ public:
                 return path;
             }
 
+            // Every patch's stored normal is outward-pointing by
+            // construction, so a legitimate front-face hit always has the
+            // incoming ray pointing INTO the surface: dot(dir, hit->normal)
+            // < 0. A positive dot product here means this ray is instead
+            // striking the surface's back side — which should never happen
+            // from a ray that stayed outside the scene the whole way, and
+            // signals it tunneled through a gap in some patch's triangulated
+            // stage-1 test earlier (most likely at a high-curvature patch
+            // whose tessellation is still too coarse) and is now travelling
+            // around inside the solid. Caught here rather than silently
+            // continuing to bounce inside — which would corrupt this ray's
+            // bounce count and could trap it — same as any other
+            // intersection failure: this ray only errors out, tracing
+            // continues with the rest.
+            if (vec_dot(dir, hit->normal) > kBackfaceHitTol) {
+                path.status = RayPath::Status::Error;
+                path.error_message =
+                    "RayTracingDriver::trace_ray: hit back face of patch (dot(dir, normal) > 0) "
+                    "— ray likely tunneled through a triangulation gap";
+                return path;
+            }
+
             path.points.push_back(hit->point);
             path.hit_objects.push_back(hit->object);
             path.bounce_count++;
@@ -305,6 +335,13 @@ private:
     // can re-detect the point it just left through that padding, and the
     // ray gets stuck bouncing in place instead of moving on.
     static constexpr double kSagittaClearanceFactor = 5.0;
+
+    // Tolerance on dot(dir, hit->normal) for the back-face-hit check in
+    // trace_ray(): a small positive slack rather than a strict > 0, so a
+    // legitimate near-grazing front-face hit (dot product a tiny positive
+    // epsilon due to floating-point/interpolation noise, not an actual
+    // tunneled ray) isn't misflagged as an error.
+    static constexpr double kBackfaceHitTol = 1e-9;
 
     void load_patches(const std::string& patch_directory) {
         namespace fs = std::filesystem;

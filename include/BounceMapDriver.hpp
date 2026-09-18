@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -70,37 +71,88 @@ public:
                      const std::string& file_prefix,
                      int first_index_1based,
                      int last_index_1based)
-        : driver_(patch_directory)
+        : driver_(patch_directory), first_index_1based_(first_index_1based)
     {
         load_sample_patches(patch_directory, file_prefix, first_index_1based, last_index_1based);
     }
 
     // For every sampled patch: samples a position_grid_n x position_grid_n
     // grid of surface points (SurfacePatch::sample_grid), and at each point
-    // sweeps a theta_n x phi_n solid-angle-uniform hemisphere of outgoing
+    // sweeps a theta_n x phi_n solid-angle-uniform sweep of outgoing
     // directions about the local normal, tracing each with
     // RayTracingDriver::trace_ray(..., max_bounces) against the FULL scene
     // and keeping the largest bounce_count seen there (directions whose
     // trace errors are skipped). Safe to call again with different
     // resolutions; results replace any prior run.
-    void run(int position_grid_n, int theta_n, int phi_n, int max_bounces = 50) {
+    //
+    // `cone_angle_deg` restricts the swept directions to a cone centered on
+    // the local normal, given as the cone's full apex angle (edge to edge,
+    // not the half-angle from the normal to the edge) — e.g. 180 (the
+    // default) sweeps the entire hemisphere, 90 sweeps only directions
+    // within 45 degrees of the normal. Directions stay solid-angle-uniform
+    // within that narrowed cone, so theta_n/phi_n keep the same meaning
+    // regardless of cone_angle_deg. Must be in (0, 180].
+    //
+    // `capture_best_rays`, when true, additionally keeps the full traced
+    // path (every bounce point, not just the count) of whichever direction
+    // achieved each point's MaxBounces — the single best ray launched from
+    // that point, ties broken by whichever is found first. These are held
+    // in memory (one RayPath per grid point) for write_best_ray_vtks() to
+    // dump afterward; left false (the default) to avoid that memory cost
+    // when the per-point rays themselves aren't needed.
+    void run(int position_grid_n, int theta_n, int phi_n, double cone_angle_deg = 180.0, int max_bounces = 50,
+              bool capture_best_rays = false) {
         if (position_grid_n < 2) {
             throw std::invalid_argument("BounceMapDriver::run: position_grid_n must be >= 2");
         }
         if (theta_n < 1 || phi_n < 1) {
             throw std::invalid_argument("BounceMapDriver::run: theta_n and phi_n must both be >= 1");
         }
+        if (!(cone_angle_deg > 0.0) || cone_angle_deg > 180.0) {
+            throw std::invalid_argument("BounceMapDriver::run: cone_angle_deg must be in (0, 180]");
+        }
 
-        patch_grids_.clear();
-        patch_max_bounces_.clear();
-        patch_error_counts_.clear();
-        patch_grids_.reserve(sample_patches_.size());
-        patch_max_bounces_.reserve(sample_patches_.size());
-        patch_error_counts_.reserve(sample_patches_.size());
+        // mu == cos(theta) at the cone's edge (theta == half-angle); mu is
+        // swept over [cos_theta_max, 1] here instead of the full [0, 1] a
+        // full hemisphere uses, narrowing the sweep to this cone while
+        // keeping it solid-angle-uniform within it.
+        const double half_angle_deg = cone_angle_deg / 2.0;
+        const double cos_theta_max = std::cos(half_angle_deg * kTwoPi / 360.0);
 
-        const size_t num_patches = sample_patches_.size();
-        for (size_t patch_num = 0; patch_num < num_patches; ++patch_num) {
-            const auto& patch = sample_patches_[patch_num];
+        capture_best_rays_ = capture_best_rays;
+
+        const long long num_patches = static_cast<long long>(sample_patches_.size());
+        patch_grids_.assign(static_cast<size_t>(num_patches), SurfacePatch::SampledGrid{});
+        patch_max_bounces_.assign(static_cast<size_t>(num_patches), {});
+        patch_error_counts_.assign(static_cast<size_t>(num_patches), {});
+        patch_best_paths_.clear();
+        if (capture_best_rays_) {
+            patch_best_paths_.assign(static_cast<size_t>(num_patches), {});
+        }
+
+        // sample_grid()'s point count depends only on position_grid_n, not
+        // on which patch, so every patch contributes exactly this many
+        // points and the run's total is known up front.
+        const long long points_per_patch =
+            static_cast<long long>(position_grid_n) * static_cast<long long>(position_grid_n);
+        const long long total_points = num_patches * points_per_patch;
+
+        // One progress bar for the WHOLE run rather than one per patch:
+        // patches are now processed concurrently (one OpenMP thread per
+        // patch, not one thread per grid point within a patch), so a
+        // per-patch bar redrawn via '\r' would have multiple threads
+        // fighting over the same line. Every thread instead bumps this one
+        // shared counter as it finishes a point from whichever patch it's
+        // working on and (throttled, under a critical section) redraws the
+        // single bar. The counter is monotonic regardless of which
+        // patch/point finishes first, so the percentage shown never goes
+        // backwards even though completion order is unordered.
+        std::atomic<long long> completed{ 0 };
+        const long long print_every = std::max<long long>(1, total_points / 100);
+
+        #pragma omp parallel for schedule(dynamic)
+        for (long long patch_num = 0; patch_num < num_patches; ++patch_num) {
+            const auto& patch = sample_patches_[static_cast<size_t>(patch_num)];
             // Sized off THIS patch's own curvature padding, not a scene-wide
             // worst case — see RayTracingDriver::self_intersect_epsilon()'s
             // comment. Using the scene-wide value here would over-nudge (or
@@ -118,18 +170,15 @@ public:
             // `best` never left its initial 0. Written out alongside
             // MaxBounces so the two can be told apart in ParaView.
             std::vector<int> error_count_at_point(static_cast<size_t>(nn), 0);
+            // Only allocated when capture_best_rays_ is set — otherwise left
+            // empty so a run that doesn't need per-point rays doesn't pay to
+            // hold nn RayPath objects (each carrying its own points vector)
+            // per patch.
+            std::vector<RayTracingDriver::RayPath> best_path_at_point;
+            if (capture_best_rays_) {
+                best_path_at_point.resize(static_cast<size_t>(nn));
+            }
 
-            // Progress bar for this patch's grid-point sweep: each thread
-            // bumps a shared atomic counter as it finishes a point and
-            // (throttled, under a critical section so lines don't
-            // interleave) redraws the bar in place with \r. The counter is
-            // monotonic regardless of which thread's iteration finishes
-            // first under dynamic scheduling, so the percentage shown never
-            // goes backwards even though completion order is unordered.
-            std::atomic<long long> completed{ 0 };
-            const long long print_every = std::max<long long>(1, nn / 100);
-
-            #pragma omp parallel for schedule(dynamic)
             for (long long k = 0; k < nn; ++k) {
                 const size_t idx = static_cast<size_t>(k);
                 const Vec3 point = { grid.x[idx], grid.y[idx], grid.z[idx] };
@@ -149,11 +198,14 @@ public:
 
                 int best = 0;
                 int n_errors = 0;
+                bool have_best_path = false;
                 for (int ti = 0; ti < theta_n; ++ti) {
-                    // Solid-angle-uniform, cell-centered in cos(theta): mu is
-                    // strictly inside (0,1), so theta never lands exactly on
-                    // the pole or the grazing equator.
-                    const double mu = (static_cast<double>(ti) + 0.5) / static_cast<double>(theta_n);
+                    // Solid-angle-uniform, cell-centered in cos(theta) over
+                    // [cos_theta_max, 1]: mu is strictly inside that open
+                    // interval, so theta never lands exactly on the pole or
+                    // exactly on the cone's edge.
+                    const double mu = cos_theta_max +
+                        (static_cast<double>(ti) + 0.5) / static_cast<double>(theta_n) * (1.0 - cos_theta_max);
                     const double sin_theta = std::sqrt(std::max(0.0, 1.0 - mu * mu));
 
                     for (int pj = 0; pj < phi_n; ++pj) {
@@ -167,31 +219,43 @@ public:
                             t1.z * sin_theta * cos_phi + t2.z * sin_theta * sin_phi + normal.z * mu
                         };
 
-                        const RayTracingDriver::RayPath path = driver_.trace_ray(origin, dir, max_bounces);
+                        RayTracingDriver::RayPath path = driver_.trace_ray(origin, dir, max_bounces);
                         if (path.status == RayTracingDriver::RayPath::Status::Error) {
                             ++n_errors;
                             continue;  // skip this direction, keep going
                         }
-                        best = std::max(best, path.bounce_count);
+                        const int bounce_count = path.bounce_count;
+                        // Ties keep whichever direction was found first
+                        // (strict '>', not '>=') — good enough since this is
+                        // only for visualizing a representative deep ray,
+                        // not picking out a unique "the" best one.
+                        if (capture_best_rays_ && (!have_best_path || bounce_count > best_path_at_point[idx].bounce_count)) {
+                            have_best_path = true;
+                            best_path_at_point[idx] = std::move(path);
+                        }
+                        best = std::max(best, bounce_count);
                     }
                 }
                 max_bounces_at_point[idx] = best;
                 error_count_at_point[idx] = n_errors;
 
                 const long long done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (done % print_every == 0 || done == nn) {
+                if (done % print_every == 0 || done == total_points) {
                     #pragma omp critical(bounce_map_progress)
                     {
-                        print_progress(patch_num + 1, num_patches, done, nn);
+                        print_progress(done, total_points);
                     }
                 }
             }
-            std::cout << '\n';  // finalize this patch's bar, move to the next line
 
-            patch_grids_.push_back(std::move(grid));
-            patch_max_bounces_.push_back(std::move(max_bounces_at_point));
-            patch_error_counts_.push_back(std::move(error_count_at_point));
+            patch_grids_[static_cast<size_t>(patch_num)] = std::move(grid);
+            patch_max_bounces_[static_cast<size_t>(patch_num)] = std::move(max_bounces_at_point);
+            patch_error_counts_[static_cast<size_t>(patch_num)] = std::move(error_count_at_point);
+            if (capture_best_rays_) {
+                patch_best_paths_[static_cast<size_t>(patch_num)] = std::move(best_path_at_point);
+            }
         }
+        std::cout << '\n';  // finalize the bar, move to the next line
     }
 
     // Writes the sampled range as one triangulated legacy ASCII VTK
@@ -270,14 +334,95 @@ public:
         for (int e : all_errors) out << e << '\n';
     }
 
+    // Writes, for each sampled patch, the single best (most-bounces) ray
+    // launched from every one of that patch's grid points as its own legacy
+    // ASCII VTK PolyData file of line segments — one file per patch, all
+    // dropped into `output_directory` (created if it doesn't already
+    // exist). Each traced path becomes one 2-point LINE cell per bounce leg,
+    // matching RayTracingDriver::write_vtk()'s layout, with per-cell
+    // PointID/BounceIndex scalars so an individual point's ray (or a
+    // specific leg of it) can be picked out in ParaView. Requires
+    // run(..., /*capture_best_rays=*/true) to have been called first.
+    void write_best_ray_vtks(const std::string& output_directory,
+                              const std::string& file_prefix = "best_rays_patch_") const {
+        if (!capture_best_rays_) {
+            throw std::runtime_error(
+                "BounceMapDriver::write_best_ray_vtks: best rays weren't captured — "
+                "call run(..., /*capture_best_rays=*/true) first");
+        }
+        if (patch_best_paths_.empty()) {
+            throw std::runtime_error("BounceMapDriver::write_best_ray_vtks: no data — call run() first");
+        }
+
+        std::filesystem::create_directories(output_directory);
+
+        for (size_t p = 0; p < patch_best_paths_.size(); ++p) {
+            const auto& paths = patch_best_paths_[p];
+
+            std::vector<Vec3> all_points;
+            struct Segment { int p0, p1, point_id, bounce_index; };
+            std::vector<Segment> segments;
+
+            for (size_t point_idx = 0; point_idx < paths.size(); ++point_idx) {
+                const RayTracingDriver::RayPath& path = paths[point_idx];
+                const int base = static_cast<int>(all_points.size());
+                for (const Vec3& pt : path.points) all_points.push_back(pt);
+
+                for (size_t k = 0; k + 1 < path.points.size(); ++k) {
+                    segments.push_back({ base + static_cast<int>(k), base + static_cast<int>(k) + 1,
+                                          static_cast<int>(point_idx), static_cast<int>(k) });
+                }
+            }
+
+            // Named after the on-disk patch index (first_index_1based_ + p),
+            // matching load_sample_patches()'s "<file_prefix><i>.txt"
+            // numbering, not this vector's own 0-based position.
+            const std::string filename = output_directory + "/" + file_prefix +
+                std::to_string(first_index_1based_ + static_cast<int>(p)) + ".vtk";
+            std::ofstream out(filename);
+            if (!out.is_open()) {
+                throw std::runtime_error("BounceMapDriver::write_best_ray_vtks: cannot open output file: " + filename);
+            }
+
+            out << "# vtk DataFile Version 3.0\n";
+            out << "Best bounce ray per grid point\n";
+            out << "ASCII\n";
+            out << "DATASET POLYDATA\n";
+
+            out << "POINTS " << all_points.size() << " double\n";
+            for (const Vec3& pt : all_points) {
+                out << pt.x << ' ' << pt.y << ' ' << pt.z << '\n';
+            }
+
+            out << "LINES " << segments.size() << ' ' << segments.size() * 3 << '\n';
+            for (const Segment& s : segments) {
+                out << "2 " << s.p0 << ' ' << s.p1 << '\n';
+            }
+
+            out << "CELL_DATA " << segments.size() << '\n';
+            out << "SCALARS PointID int 1\nLOOKUP_TABLE default\n";
+            for (const Segment& s : segments) out << s.point_id << '\n';
+            out << "SCALARS BounceIndex int 1\nLOOKUP_TABLE default\n";
+            for (const Segment& s : segments) out << s.bounce_index << '\n';
+        }
+    }
+
     const RayTracingDriver& driver() const { return driver_; }
 
 private:
     RayTracingDriver driver_;                                  // full scene (every *.txt in the directory)
     std::vector<std::unique_ptr<SurfacePatch>> sample_patches_; // just the range being sampled
+    int first_index_1based_ = 1;  // sample_patches_[p] is on-disk index (first_index_1based_ + p) — see load_sample_patches()
     std::vector<SurfacePatch::SampledGrid> patch_grids_;
     std::vector<std::vector<int>> patch_max_bounces_;
     std::vector<std::vector<int>> patch_error_counts_;  // parallel to patch_max_bounces_; see run()
+
+    // Only populated when run() is called with capture_best_rays == true —
+    // see run()'s and write_best_ray_vtks()'s comments. Parallel to
+    // patch_grids_: patch_best_paths_[p][idx] is the best (most-bounces)
+    // ray traced from patch_grids_[p]'s point `idx`.
+    bool capture_best_rays_ = false;
+    std::vector<std::vector<RayTracingDriver::RayPath>> patch_best_paths_;
 
     static constexpr double kTwoPi = 6.283185307179586476925286766559;
     static constexpr int kProgressBarWidth = 30;
@@ -288,15 +433,15 @@ private:
     static constexpr double kTangentDegenerateRelTol = 1e-6;
 
     // Redraws a single-line progress bar in place (via '\r', no newline) for
-    // the grid-point sweep of patch `patch_num_1based` out of `num_patches`.
-    // Called from inside a #pragma omp critical section — must not be
-    // called concurrently.
-    static void print_progress(size_t patch_num_1based, size_t num_patches,
-                                long long done, long long total) {
+    // the grid-point sweep across ALL sampled patches combined — patches are
+    // processed concurrently (one OpenMP thread per patch), so there is no
+    // single "current patch" left to name in the bar. Called from inside a
+    // #pragma omp critical section — must not be called concurrently.
+    static void print_progress(long long done, long long total) {
         const double frac = total > 0 ? static_cast<double>(done) / static_cast<double>(total) : 1.0;
         const int filled = static_cast<int>(frac * kProgressBarWidth);
 
-        std::cout << '\r' << "Patch " << patch_num_1based << '/' << num_patches << " [";
+        std::cout << '\r' << "Bounce map [";
         for (int i = 0; i < kProgressBarWidth; ++i) {
             std::cout << (i < filled ? '#' : '-');
         }
